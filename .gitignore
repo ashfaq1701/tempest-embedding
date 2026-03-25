@@ -1,0 +1,14 @@
+.idea/
+.venv/
+.DS_Store
+__pycache__/
+*.pyc
+
+data/*.csv
+data/*.npy
+
+best_models/*
+!best_models/.gitkeep
+
+log/*
+!log/README.md
