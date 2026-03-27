@@ -75,14 +75,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--verbosity', type=int, default=1)
 
     # Tempest-facing knobs
-    parser.add_argument('--use_gpu_walks', action='store_true', default=False)
+    parser.add_argument('--walk_use_gpu', action='store_true', default=False)
     parser.add_argument('--walk_direction', type=str, default='Backward_In_Time', choices=['Backward_In_Time', 'Forward_In_Time'])
-    parser.add_argument('--walk_bias', type=str, default='SpatioTemporal')
-    parser.add_argument('--initial_edge_bias', type=str, default=None)
-    parser.add_argument('--max_walk_len', type=int, default=3)
+    parser.add_argument('--walk_bias', type=str, default='ExponentialWeight')
+    parser.add_argument('--initial_edge_bias', type=str, default='Uniform')
+    parser.add_argument('--max_walk_len', type=int, default=80)
+    parser.add_argument('--num_walks_per_node', type=int, default=10)
     parser.add_argument('--walk_padding_value', type=int, default=0)
     parser.add_argument('--max_time_capacity', type=int, default=-1)
     parser.add_argument('--timescale_bound', type=float, default=-1.0)
+    parser.add_argument('--temporal_micro_batch_max_size', type=int, default=1_000_000)
+
     return parser
 
 
