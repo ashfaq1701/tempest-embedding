@@ -6,4 +6,4 @@ scikit-learn==1.7.2
 torch==2.10.0
 torchdiffeq==0.2.5
 tqdm==4.67.3
-temporal-random-walk
+temporal-random-walk>=1.6.1

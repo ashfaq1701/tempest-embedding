@@ -19,6 +19,7 @@ class TempestWalkBackend:
             enable_temporal_node2vec=enable_tn2v,
             timescale_bound=args.timescale_bound,
             walk_padding_value=args.walk_padding_value,
+            shuffle_walk_order=False
         )
 
     # -----------------------------
