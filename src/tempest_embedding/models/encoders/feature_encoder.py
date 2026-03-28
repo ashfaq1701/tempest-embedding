@@ -55,13 +55,22 @@ class FeatureEncoder(nn.Module):
         batch, n_walk, len_walk, feat_dim = X.shape
         X = X.view(batch * n_walk, len_walk, feat_dim)
         t_records = t_records.view(batch * n_walk, len_walk, 1)
+
+        if mask is not None:
+            # mask: (batch, n_walk, len_walk) bool — True for valid positions
+            mask = mask.view(batch * n_walk, len_walk)
+
         h = torch.zeros(batch * n_walk, self.hidden_dim).type_as(X)
         for i in range(X.shape[1] - 1):
-            h = self.gru(X[:, i, :], h)
+            h_gru = self.gru(X[:, i, :], h)
+            if mask is not None:
+                gru_active = mask[:, i].unsqueeze(-1)       # (BW, 1)
+                h_gru = torch.where(gru_active, h_gru, h)
+
             t0 = t_records[:, i + 1, :]
             t1 = t_records[:, i, :]
             delta_t = torch.log10(torch.abs(t1 - t0) + 1.0) + 0.01
-            state = (torch.zeros_like(t0), delta_t, h)
+            state = (torch.zeros_like(t0), delta_t, h_gru)
             ts = torch.tensor([self.start_time, self.end_time]).type_as(X)
             if self.solver in {'euler', 'rk4'}:
                 solution = odeint(self, state, ts, method=self.solver, options=dict(step_size=self.step_size))
@@ -69,8 +78,23 @@ class FeatureEncoder(nn.Module):
                 solution = odeint(self, state, ts, method=self.solver)
             else:
                 raise NotImplementedError(f'{self.solver} solver is not implemented.')
-            _, _, h = tuple(s[-1] for s in solution)
-        encoded_features = self.gru(X[:, -1, :], h)
+            _, _, h_ode = tuple(s[-1] for s in solution)
+
+            if mask is not None:
+                # Only advance through ODE if the next position is valid
+                ode_active = mask[:, i + 1].unsqueeze(-1)   # (BW, 1)
+                h = torch.where(ode_active, h_ode, h_gru)
+            else:
+                h = h_ode
+
+        # Final GRU on last position
+        h_final = self.gru(X[:, -1, :], h)
+        if mask is not None:
+            final_active = mask[:, -1].unsqueeze(-1)
+            encoded_features = torch.where(final_active, h_final, h)
+        else:
+            encoded_features = h_final
+
         encoded_features = encoded_features.view(batch, n_walk, self.hidden_dim)
         return self.dropout(encoded_features)
 
