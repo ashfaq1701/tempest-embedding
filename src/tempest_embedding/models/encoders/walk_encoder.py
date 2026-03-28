@@ -38,16 +38,17 @@ class WalkEncoder(nn.Module):
                 d_model=self.attn_dim, nhead=self.n_head, dim_feedforward=4 * self.model_dim,
                 dropout=self.dropout_p, activation='relu'
             )
-        self.pooler = SetPooler(self.attn_dim, self.out_dim, dropout_p=self.dropout_p, walk_linear_out=walk_linear_out)
+        self.pooler = SetPooler(self.attn_dim, self.out_dim, dropout=self.dropout_p, linear_out=walk_linear_out)
 
-    def forward_one_node(self, hidden_embeddings, edge_features, position_features, t_records, masks=None):
+    def forward_one_node(self, hidden_embeddings, edge_features, position_features, t_records, masks=None, pool=True):
         combined_features = self.aggregate(hidden_embeddings, edge_features, position_features)
         combined_features = self.feature_encoder.integrate(t_records, combined_features, masks)
         if self.pos_dim > 0:
             position_features = self.position_encoder.integrate(t_records, position_features, masks)
             combined_features = torch.cat([combined_features, position_features], dim=-1)
         x = self.projector(combined_features)
-        x = self.pooler(x, agg='mean')
+        if pool:
+            x = self.pooler(x, agg='mean')
         return x
 
     def mutual_query(self, src_embed, tgt_embed):
