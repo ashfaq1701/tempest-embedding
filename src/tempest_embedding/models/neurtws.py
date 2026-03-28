@@ -92,28 +92,16 @@ class NeurTWs(nn.Module):
     def _get_walks(self, node_ids):
         """Slice stored walks for a batch of node IDs.
 
-        Nodes absent from the current walk set get zero-padded (empty) walks.
-
         Returns: (nodes, times, lens, edge_feats) tensors.
         """
-        N = self._walk_nodes.size(0)
-        raw = [self._node2idx.get(int(nid), N) for nid in node_ids]
-        idx = torch.tensor(raw, dtype=torch.long, device=self._walk_nodes.device)
-
-        # Append one padding row of zeros so index N is valid
-        pad_nodes = torch.zeros(1, *self._walk_nodes.shape[1:], dtype=self._walk_nodes.dtype, device=self._walk_nodes.device)
-        pad_times = torch.zeros(1, *self._walk_times.shape[1:], dtype=self._walk_times.dtype, device=self._walk_times.device)
-        pad_lens = torch.zeros(1, *self._walk_lens.shape[1:], dtype=self._walk_lens.dtype, device=self._walk_lens.device)
-
-        nodes = torch.cat([self._walk_nodes, pad_nodes], dim=0)[idx]
-        times = torch.cat([self._walk_times, pad_times], dim=0)[idx]
-        lens = torch.cat([self._walk_lens, pad_lens], dim=0)[idx]
-
-        if self._walk_edge_feats is not None:
-            pad_ef = torch.zeros(1, *self._walk_edge_feats.shape[1:], dtype=self._walk_edge_feats.dtype, device=self._walk_edge_feats.device)
-            ef = torch.cat([self._walk_edge_feats, pad_ef], dim=0)[idx]
-        else:
-            ef = None
+        idx = torch.tensor(
+            [self._node2idx[int(nid)] for nid in node_ids],
+            dtype=torch.long, device=self._walk_nodes.device,
+        )
+        nodes = self._walk_nodes[idx]
+        times = self._walk_times[idx]
+        lens = self._walk_lens[idx]
+        ef = self._walk_edge_feats[idx] if self._walk_edge_feats is not None else None
         return nodes, times, lens, ef
 
     # ------------------------------------------------------------------
