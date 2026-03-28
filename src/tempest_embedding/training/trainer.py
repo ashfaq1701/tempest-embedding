@@ -58,10 +58,8 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     val_src, val_dst, val_ts, val_e_idx, val_label = splits.val
 
     # ------------------------------------------------------------------
-    # Samplers & helpers
+    # Helpers
     # ------------------------------------------------------------------
-    train_sampler = RandEdgeSampler([train_src], [train_dst])
-    val_sampler = RandEdgeSampler([train_src, val_src], [train_dst, val_dst])
     batcher = WalkBatcher(args.num_walks_per_node, args.max_walk_len)
     early_stopper = EarlyStopMonitor(higher_better=True, tolerance=args.tolerance)
 
@@ -112,6 +110,10 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
                 )
                 model.set_walks(nodes, times, lens, edge_feats)
 
+                # Sampler scoped to nodes with walks in the current graph
+                walk_node_ids = nodes[:, 0, 0]
+                micro_sampler = RandEdgeSampler([walk_node_ids], [walk_node_ids])
+
                 # --- Mini-batch training over this micro-batch's edges ---
                 n_edges = m_end - m_start
                 perm = np.random.permutation(n_edges)
@@ -125,7 +127,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
 
                     # Negative destinations: (batch, num_negs)
                     neg_b = np.stack(
-                        [train_sampler.sample(len(src_b))[1] for _ in range(args.negs)],
+                        [micro_sampler.sample(len(src_b))[1] for _ in range(args.negs)],
                         axis=1,
                     )
 
@@ -142,6 +144,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         # ----------------------------------------------------------
         # Validation (walks are from the last window = full train graph)
         # ----------------------------------------------------------
+        val_sampler = RandEdgeSampler([walk_node_ids], [walk_node_ids])
         val_ap, val_auc = eval_one_epoch(
             model, val_sampler, val_src, val_dst, val_ts, val_label, val_e_idx,
         )
@@ -182,10 +185,8 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     )
     model.set_walks(nodes, times, lens, edge_feats)
 
-    test_sampler = RandEdgeSampler(
-        [train_src, val_src, test_src],
-        [train_dst, val_dst, test_dst],
-    )
+    test_walk_node_ids = nodes[:, 0, 0]
+    test_sampler = RandEdgeSampler([test_walk_node_ids], [test_walk_node_ids])
     test_ap, test_auc = eval_one_epoch(
         model, test_sampler, test_src, test_dst, test_ts, test_label, test_e_idx,
     )
@@ -197,7 +198,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     if splits.test_new_new is not None:
         nn_src, nn_dst, nn_ts, nn_eidx, nn_label = splits.test_new_new
         if len(nn_src) > 0:
-            nn_sampler = RandEdgeSampler([nn_src], [nn_dst])
+            nn_sampler = RandEdgeSampler([test_walk_node_ids], [test_walk_node_ids])
             nn_ap, nn_auc = eval_one_epoch(
                 model, nn_sampler, nn_src, nn_dst, nn_ts, nn_label, nn_eidx,
             )
@@ -207,7 +208,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     if splits.test_new_old is not None:
         no_src, no_dst, no_ts, no_eidx, no_label = splits.test_new_old
         if len(no_src) > 0:
-            no_sampler = RandEdgeSampler([no_src], [no_dst])
+            no_sampler = RandEdgeSampler([test_walk_node_ids], [test_walk_node_ids])
             no_ap, no_auc = eval_one_epoch(
                 model, no_sampler, no_src, no_dst, no_ts, no_label, no_eidx,
             )
