@@ -4,12 +4,29 @@ import time
 
 import numpy as np
 import torch
+from temporal_negative_edge_sampler import collect_all_negatives_by_timestamp
 
 from ..training.evaluator import eval_one_epoch
-from ..training.negative import RandEdgeSampler
 from ..utils.misc import EarlyStopMonitor
 from ..walks.batching import WalkBatcher
 from ..walks.tempest import TempestWalkBackend
+
+
+def _sample_negatives(src, dst, ts, num_negs):
+    """Sample random negatives for a batch of edges.
+
+    Calls the temporal negative edge sampler with 0% historical (pure random).
+    Returns (N, num_negs) array of negative target node IDs.
+    """
+    _, neg_tgt = collect_all_negatives_by_timestamp(
+        src.astype(np.int32),
+        dst.astype(np.int32),
+        ts.astype(np.int64),
+        is_directed=False,
+        num_negatives_per_positive=num_negs,
+        historical_negative_percentage=0.0,
+    )
+    return neg_tgt.reshape(-1, num_negs)
 
 
 def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_path):
@@ -17,10 +34,11 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
 
     Per epoch:
       1. Create a fresh TempestWalkBackend.
-      2. For each chronological batch of --batch_size edges:
+      2. For each chronological batch of --walk_generator_batch_size edges:
            a. Ingest the batch's edges (cumulative, no eviction).
            b. Generate walks for all nodes in current graph state.
-           c. Mini-batch over the batch's edges for gradient updates.
+           c. Sample negatives for this batch.
+           d. Mini-batch over the batch's edges for gradient updates.
       3. Validate via eval_one_epoch; checkpoint + early stopping.
 
     After training: load best model, build train+val graph, evaluate on test set.
@@ -45,12 +63,11 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     walk_generator_batch_size = args.walk_generator_batch_size
 
     val_src, val_dst, val_ts, val_e_idx, val_label = splits.val
+    test_src, test_dst, test_ts, test_e_idx, test_label = splits.test
 
     # ------------------------------------------------------------------
-    # Samplers & helpers
+    # Helpers
     # ------------------------------------------------------------------
-    train_sampler = RandEdgeSampler([train_src], [train_dst])
-    val_sampler = RandEdgeSampler([train_src, val_src], [train_dst, val_dst])
     batcher = WalkBatcher(args.num_walks_per_node, args.max_walk_len)
     early_stopper = EarlyStopMonitor(higher_better=True, tolerance=args.tolerance)
 
@@ -85,6 +102,9 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
             )
             model.set_walks(nodes, times, lens, edge_feats)
 
+            # Sample negatives for this batch (fresh each epoch)
+            b_neg = _sample_negatives(b_src, b_dst, b_ts, args.negs)
+
             # Mini-batch training over this batch's edges
             n_edges = b_end - b_start
             perm = np.random.permutation(n_edges)
@@ -95,11 +115,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
 
                 src_mb = b_src[mb_idx]
                 dst_mb = b_dst[mb_idx]
-
-                neg_mb = np.stack(
-                    [train_sampler.sample(len(src_mb))[1] for _ in range(args.negs)],
-                    axis=1,
-                )
+                neg_mb = b_neg[mb_idx]  # (mb_size, negs)
 
                 optimizer.zero_grad()
                 loss = model.contrast(src_mb, dst_mb, neg_mb)
@@ -114,8 +130,9 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         # ----------------------------------------------------------
         # Validation (walks are from the last batch = full train graph)
         # ----------------------------------------------------------
+        val_neg_tgt = _sample_negatives(val_src, val_dst, val_ts, args.negs)
         val_ap, val_auc = eval_one_epoch(
-            model, val_sampler, val_src, val_dst, val_ts, val_label, val_e_idx,
+            model, val_neg_tgt, val_src, val_dst, val_ts, val_label, val_e_idx,
         )
 
         logger.info(
@@ -141,8 +158,6 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
     model.eval()
 
-    test_src, test_dst, test_ts, test_e_idx, test_label = splits.test
-
     # Graph state for test: train + val edges
     test_backend = TempestWalkBackend(args)
     _ingest_edges(test_backend, train_src, train_dst, train_ts, train_e_idx, dataset)
@@ -154,12 +169,9 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     )
     model.set_walks(nodes, times, lens, edge_feats)
 
-    test_sampler = RandEdgeSampler(
-        [train_src, val_src, test_src],
-        [train_dst, val_dst, test_dst],
-    )
+    test_neg_tgt = _sample_negatives(test_src, test_dst, test_ts, args.negs)
     test_ap, test_auc = eval_one_epoch(
-        model, test_sampler, test_src, test_dst, test_ts, test_label, test_e_idx,
+        model, test_neg_tgt, test_src, test_dst, test_ts, test_label, test_e_idx,
     )
     logger.info(f'Test AP {test_ap:.4f} | Test AUC {test_auc:.4f}')
 
@@ -169,9 +181,9 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     if splits.test_new_new is not None:
         nn_src, nn_dst, nn_ts, nn_eidx, nn_label = splits.test_new_new
         if len(nn_src) > 0:
-            nn_sampler = RandEdgeSampler([nn_src], [nn_dst])
+            nn_neg_tgt = _sample_negatives(nn_src, nn_dst, nn_ts, args.negs)
             nn_ap, nn_auc = eval_one_epoch(
-                model, nn_sampler, nn_src, nn_dst, nn_ts, nn_label, nn_eidx,
+                model, nn_neg_tgt, nn_src, nn_dst, nn_ts, nn_label, nn_eidx,
             )
             logger.info(f'Test new-new  AP {nn_ap:.4f} | AUC {nn_auc:.4f}')
             results['nn_ap'], results['nn_auc'] = nn_ap, nn_auc
@@ -179,9 +191,9 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     if splits.test_new_old is not None:
         no_src, no_dst, no_ts, no_eidx, no_label = splits.test_new_old
         if len(no_src) > 0:
-            no_sampler = RandEdgeSampler([no_src], [no_dst])
+            no_neg_tgt = _sample_negatives(no_src, no_dst, no_ts, args.negs)
             no_ap, no_auc = eval_one_epoch(
-                model, no_sampler, no_src, no_dst, no_ts, no_label, no_eidx,
+                model, no_neg_tgt, no_src, no_dst, no_ts, no_label, no_eidx,
             )
             logger.info(f'Test new-old  AP {no_ap:.4f} | AUC {no_auc:.4f}')
             results['no_ap'], results['no_auc'] = no_ap, no_auc
