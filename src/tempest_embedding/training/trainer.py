@@ -42,7 +42,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     train_e_idx = train_e_idx[sort_idx]
 
     num_train = len(train_src)
-    batch_size = args.batch_size
+    walk_generator_batch_size = args.walk_generator_batch_size
 
     val_src, val_dst, val_ts, val_e_idx, val_label = splits.val
 
@@ -68,8 +68,8 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         # Fresh walk backend each epoch (walks are stochastic)
         backend = TempestWalkBackend(args)
 
-        for b_start in range(0, num_train, batch_size):
-            b_end = min(b_start + batch_size, num_train)
+        for b_start in range(0, num_train, walk_generator_batch_size):
+            b_end = min(b_start + walk_generator_batch_size, num_train)
 
             b_src = train_src[b_start:b_end]
             b_dst = train_dst[b_start:b_end]
