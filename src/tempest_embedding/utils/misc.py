@@ -84,9 +84,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--walk_padding_value', type=int, default=0)
     parser.add_argument('--max_time_capacity', type=int, default=-1)
     parser.add_argument('--timescale_bound', type=float, default=-1.0)
-    parser.add_argument('--temporal_batch_duration', type=float, required=True,
-                        help='Time-window duration in raw timestamp units (mandatory)')
-    parser.add_argument('--temporal_micro_batch_max_size', type=int, default=1_000_000)
+    parser.add_argument('--batch_size', type=int, default=10_000,
+                        help='Number of edges per chronological batch for walk regeneration')
 
     return parser
 

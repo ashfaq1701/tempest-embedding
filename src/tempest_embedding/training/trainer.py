@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import time
 
 import numpy as np
@@ -14,15 +13,14 @@ from ..walks.tempest import TempestWalkBackend
 
 
 def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_path):
-    """Time-windowed training loop with incremental Tempest ingestion.
+    """Training loop with incremental Tempest ingestion.
 
     Per epoch:
       1. Create a fresh TempestWalkBackend.
-      2. For each time-duration window (--temporal_batch_duration in raw ts units):
-           For each micro-batch within the window (--temporal_micro_batch_max_size):
-             a. Ingest the micro-batch's edges (cumulative, no eviction).
-             b. Generate walks for all nodes in current graph state.
-             c. Mini-batch over the micro-batch's edges for gradient updates.
+      2. For each chronological batch of --batch_size edges:
+           a. Ingest the batch's edges (cumulative, no eviction).
+           b. Generate walks for all nodes in current graph state.
+           c. Mini-batch over the batch's edges for gradient updates.
       3. Validate via eval_one_epoch; checkpoint + early stopping.
 
     After training: load best model, build train+val graph, evaluate on test set.
@@ -44,16 +42,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     train_e_idx = train_e_idx[sort_idx]
 
     num_train = len(train_src)
-    micro_batch_size = args.temporal_micro_batch_max_size
-
-    # Time-duration window boundaries
-    ts_min, ts_max = float(train_ts[0]), float(train_ts[-1])
-    duration = args.temporal_batch_duration
-    window_bounds = []  # list of (t_start, t_end)
-    t = ts_min
-    while t < ts_max:
-        window_bounds.append((t, t + duration))
-        t += duration
+    batch_size = args.batch_size
 
     val_src, val_dst, val_ts, val_e_idx, val_label = splits.val
 
@@ -79,68 +68,51 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         # Fresh walk backend each epoch (walks are stochastic)
         backend = TempestWalkBackend(args)
 
-        for t_start, t_end in window_bounds:
-            # Select edges in this time-duration window
-            win_mask = (train_ts >= t_start) & (train_ts < t_end)
-            w_src = train_src[win_mask]
-            w_dst = train_dst[win_mask]
-            w_ts = train_ts[win_mask]
-            w_eidx = train_e_idx[win_mask]
+        for b_start in range(0, num_train, batch_size):
+            b_end = min(b_start + batch_size, num_train)
 
-            if len(w_src) == 0:
-                continue
+            b_src = train_src[b_start:b_end]
+            b_dst = train_dst[b_start:b_end]
+            b_ts = train_ts[b_start:b_end]
+            b_eidx = train_e_idx[b_start:b_end]
 
-            # Split into micro-batches for bursty windows
-            n_win = len(w_src)
-            num_micro = math.ceil(n_win / micro_batch_size)
+            # Ingest + walk generation per batch
+            _ingest_edges(backend, b_src, b_dst, b_ts, b_eidx, dataset)
 
-            for m in range(num_micro):
-                m_start = m * micro_batch_size
-                m_end = min(m_start + micro_batch_size, n_win)
+            nodes, times, lens, edge_feats = backend.generate_walks()
+            nodes, times, lens, edge_feats = batcher.reshape_walks(
+                nodes, times, lens, edge_feats,
+            )
+            model.set_walks(nodes, times, lens, edge_feats)
 
-                m_src = w_src[m_start:m_end]
-                m_dst = w_dst[m_start:m_end]
-                m_ts = w_ts[m_start:m_end]
-                m_eidx = w_eidx[m_start:m_end]
+            # Mini-batch training over this batch's edges
+            n_edges = b_end - b_start
+            perm = np.random.permutation(n_edges)
 
-                # --- Ingest + walk generation per micro-batch ---
-                _ingest_edges(backend, m_src, m_dst, m_ts, m_eidx, dataset)
+            for mb_start in range(0, n_edges, args.bs):
+                mb_end = min(mb_start + args.bs, n_edges)
+                mb_idx = perm[mb_start:mb_end]
 
-                nodes, times, lens, edge_feats = backend.generate_walks()
-                nodes, times, lens, edge_feats = batcher.reshape_walks(
-                    nodes, times, lens, edge_feats,
+                src_mb = b_src[mb_idx]
+                dst_mb = b_dst[mb_idx]
+
+                neg_mb = np.stack(
+                    [train_sampler.sample(len(src_mb))[1] for _ in range(args.negs)],
+                    axis=1,
                 )
-                model.set_walks(nodes, times, lens, edge_feats)
 
-                # --- Mini-batch training over this micro-batch's edges ---
-                n_edges = m_end - m_start
-                perm = np.random.permutation(n_edges)
+                optimizer.zero_grad()
+                loss = model.contrast(src_mb, dst_mb, neg_mb)
+                loss.backward()
+                optimizer.step()
 
-                for b_start in range(0, n_edges, args.bs):
-                    b_end = min(b_start + args.bs, n_edges)
-                    b_idx = perm[b_start:b_end]
-
-                    src_b = m_src[b_idx]
-                    dst_b = m_dst[b_idx]
-
-                    # Negative destinations: (batch, num_negs)
-                    neg_b = np.stack(
-                        [train_sampler.sample(len(src_b))[1] for _ in range(args.negs)],
-                        axis=1,
-                    )
-
-                    optimizer.zero_grad()
-                    loss = model.contrast(src_b, dst_b, neg_b)
-                    loss.backward()
-                    optimizer.step()
-
-                    epoch_loss += loss.item()
-                    num_batches += 1
+                epoch_loss += loss.item()
+                num_batches += 1
 
         avg_loss = epoch_loss / max(num_batches, 1)
 
         # ----------------------------------------------------------
-        # Validation (walks are from the last window = full train graph)
+        # Validation (walks are from the last batch = full train graph)
         # ----------------------------------------------------------
         val_ap, val_auc = eval_one_epoch(
             model, val_sampler, val_src, val_dst, val_ts, val_label, val_e_idx,
