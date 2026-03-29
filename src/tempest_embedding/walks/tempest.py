@@ -55,7 +55,11 @@ class TempestWalkBackend:
             walk_direction=self.args.walk_direction,
         )
 
-        return nodes, times, lens, edge_feats
+        # Active node IDs in the same sorted order used for walk generation
+        # (shuffle_walk_order=False guarantees walks are grouped by this order)
+        active_node_ids = self.tw.get_node_ids()
+
+        return nodes, times, lens, edge_feats, active_node_ids
 
     # -----------------------------
     # Utility

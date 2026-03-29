@@ -96,11 +96,11 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
             # Ingest + walk generation per batch
             _ingest_edges(backend, b_src, b_dst, b_ts, b_eidx, dataset)
 
-            nodes, times, lens, edge_feats = backend.generate_walks()
+            nodes, times, lens, edge_feats, active_node_ids = backend.generate_walks()
             nodes, times, lens, edge_feats = batcher.reshape_walks(
                 nodes, times, lens, edge_feats,
             )
-            model.set_walks(nodes, times, lens, edge_feats)
+            model.set_walks(nodes, times, lens, edge_feats, active_node_ids)
 
             # Sample negatives for this batch (fresh each epoch)
             b_neg = _sample_negatives(b_src, b_dst, b_ts, args.negs)
@@ -163,11 +163,11 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     _ingest_edges(test_backend, train_src, train_dst, train_ts, train_e_idx, dataset)
     _ingest_edges(test_backend, val_src, val_dst, val_ts, val_e_idx, dataset)
 
-    nodes, times, lens, edge_feats = test_backend.generate_walks()
+    nodes, times, lens, edge_feats, active_node_ids = test_backend.generate_walks()
     nodes, times, lens, edge_feats = batcher.reshape_walks(
         nodes, times, lens, edge_feats,
     )
-    model.set_walks(nodes, times, lens, edge_feats)
+    model.set_walks(nodes, times, lens, edge_feats, active_node_ids)
 
     test_neg_tgt = _sample_negatives(test_src, test_dst, test_ts, args.negs)
     test_ap, test_auc = eval_one_epoch(

@@ -68,14 +68,16 @@ class NeurTWs(nn.Module):
     # Walk management
     # ------------------------------------------------------------------
 
-    def set_walks(self, nodes, times, lens, edge_feats):
+    def set_walks(self, nodes, times, lens, edge_feats, active_node_ids):
         """Store precomputed walks and build node-ID → index mapping.
 
         Args:
-            nodes:      (N, K, L) numpy int array — walk node IDs
-            times:      (N, K, L) numpy float array — walk timestamps
-            lens:       (N, K) numpy int array — actual walk lengths
-            edge_feats: (N, K, L-1, E) numpy float array, or None
+            nodes:           (N, K, L) numpy int array — walk node IDs
+            times:           (N, K, L) numpy float array — walk timestamps
+            lens:            (N, K) numpy int array — actual walk lengths
+            edge_feats:      (N, K, L-1, E) numpy float array, or None
+            active_node_ids: (N,) numpy int array — node ID for each row,
+                             from the backend's sorted active-node list.
         """
         device = next(self.parameters()).device
         self._walk_nodes = torch.from_numpy(nodes).long().to(device)
@@ -86,22 +88,42 @@ class NeurTWs(nn.Module):
         else:
             self._walk_edge_feats = None
 
-        root_ids = nodes[:, 0, 0]
-        self._node2idx = {int(nid): i for i, nid in enumerate(root_ids)}
+        self._node2idx = {int(nid): i for i, nid in enumerate(active_node_ids)}
 
     def _get_walks(self, node_ids):
         """Slice stored walks for a batch of node IDs.
 
+        Nodes absent from ``_node2idx`` (e.g. unseen during walk generation)
+        receive zero-filled walks with length 0, which the mask will blank out.
+
         Returns: (nodes, times, lens, edge_feats) tensors.
         """
-        idx = torch.tensor(
-            [self._node2idx[int(nid)] for nid in node_ids],
-            dtype=torch.long, device=self._walk_nodes.device,
-        )
-        nodes = self._walk_nodes[idx]
-        times = self._walk_times[idx]
-        lens = self._walk_lens[idx]
-        ef = self._walk_edge_feats[idx] if self._walk_edge_feats is not None else None
+        device = self._walk_nodes.device
+        idx = []
+        missing = []
+        for i, nid in enumerate(node_ids):
+            pos = self._node2idx.get(int(nid))
+            if pos is not None:
+                idx.append(pos)
+                missing.append(False)
+            else:
+                idx.append(0)  # placeholder index
+                missing.append(True)
+
+        idx_t = torch.tensor(idx, dtype=torch.long, device=device)
+        nodes = self._walk_nodes[idx_t]
+        times = self._walk_times[idx_t]
+        lens = self._walk_lens[idx_t]
+        ef = self._walk_edge_feats[idx_t] if self._walk_edge_feats is not None else None
+
+        if any(missing):
+            mask = torch.tensor(missing, dtype=torch.bool, device=device)
+            nodes[mask] = 0
+            times[mask] = 0
+            lens[mask] = 0
+            if ef is not None:
+                ef[mask] = 0
+
         return nodes, times, lens, ef
 
     # ------------------------------------------------------------------
