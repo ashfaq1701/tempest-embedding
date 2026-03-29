@@ -12,40 +12,21 @@ from ..walks.batching import WalkBatcher
 from ..walks.tempest import TempestWalkBackend
 
 
-def _precompute_negatives(src_arrays, dst_arrays, ts_arrays, num_negs):
-    """Precompute random negatives for edges across multiple splits.
+def _sample_negatives(src, dst, ts, num_negs):
+    """Sample random negatives for a batch of edges.
 
-    Concatenates all splits chronologically, calls the temporal negative edge
-    sampler once, then splits results back.  Returns a list of (N_i, num_negs)
-    arrays — one per input split.
+    Calls the temporal negative edge sampler with 0% historical (pure random).
+    Returns (N, num_negs) array of negative target node IDs.
     """
-    lengths = [len(s) for s in src_arrays]
-    all_src = np.concatenate(src_arrays)
-    all_dst = np.concatenate(dst_arrays)
-    all_ts = np.concatenate(ts_arrays)
-
-    # Sort globally by timestamp so the sampler sees edges in order
-    order = np.argsort(all_ts, kind='stable')
-    inv = np.argsort(order, kind='stable')  # to unsort results
-
     _, neg_tgt = collect_all_negatives_by_timestamp(
-        all_src[order].astype(np.int32),
-        all_dst[order].astype(np.int32),
-        all_ts[order].astype(np.int64),
+        src.astype(np.int32),
+        dst.astype(np.int32),
+        ts.astype(np.int64),
         is_directed=False,
         num_negatives_per_positive=num_negs,
         historical_negative_percentage=0.0,
     )
-
-    # (total * num_negs,) → (total, num_negs), then restore original order
-    neg_tgt = neg_tgt.reshape(-1, num_negs)[inv]
-
-    # Split back per input array
-    parts, offset = [], 0
-    for n in lengths:
-        parts.append(neg_tgt[offset:offset + n])
-        offset += n
-    return parts
+    return neg_tgt.reshape(-1, num_negs)
 
 
 def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_path):
@@ -56,7 +37,8 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
       2. For each chronological batch of --walk_generator_batch_size edges:
            a. Ingest the batch's edges (cumulative, no eviction).
            b. Generate walks for all nodes in current graph state.
-           c. Mini-batch over the batch's edges for gradient updates.
+           c. Sample negatives for this batch.
+           d. Mini-batch over the batch's edges for gradient updates.
       3. Validate via eval_one_epoch; checkpoint + early stopping.
 
     After training: load best model, build train+val graph, evaluate on test set.
@@ -82,16 +64,6 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
 
     val_src, val_dst, val_ts, val_e_idx, val_label = splits.val
     test_src, test_dst, test_ts, test_e_idx, test_label = splits.test
-
-    # ------------------------------------------------------------------
-    # Precompute negatives for train / val / test
-    # ------------------------------------------------------------------
-    train_neg_tgt, val_neg_tgt, test_neg_tgt = _precompute_negatives(
-        [train_src, val_src, test_src],
-        [train_dst, val_dst, test_dst],
-        [train_ts, val_ts, test_ts],
-        num_negs=args.negs,
-    )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -120,7 +92,6 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
             b_dst = train_dst[b_start:b_end]
             b_ts = train_ts[b_start:b_end]
             b_eidx = train_e_idx[b_start:b_end]
-            b_neg = train_neg_tgt[b_start:b_end]  # (batch, negs)
 
             # Ingest + walk generation per batch
             _ingest_edges(backend, b_src, b_dst, b_ts, b_eidx, dataset)
@@ -130,6 +101,9 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
                 nodes, times, lens, edge_feats,
             )
             model.set_walks(nodes, times, lens, edge_feats)
+
+            # Sample negatives for this batch (fresh each epoch)
+            b_neg = _sample_negatives(b_src, b_dst, b_ts, args.negs)
 
             # Mini-batch training over this batch's edges
             n_edges = b_end - b_start
@@ -156,6 +130,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         # ----------------------------------------------------------
         # Validation (walks are from the last batch = full train graph)
         # ----------------------------------------------------------
+        val_neg_tgt = _sample_negatives(val_src, val_dst, val_ts, args.negs)
         val_ap, val_auc = eval_one_epoch(
             model, val_neg_tgt, val_src, val_dst, val_ts, val_label, val_e_idx,
         )
@@ -194,6 +169,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     )
     model.set_walks(nodes, times, lens, edge_feats)
 
+    test_neg_tgt = _sample_negatives(test_src, test_dst, test_ts, args.negs)
     test_ap, test_auc = eval_one_epoch(
         model, test_neg_tgt, test_src, test_dst, test_ts, test_label, test_e_idx,
     )
@@ -205,9 +181,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     if splits.test_new_new is not None:
         nn_src, nn_dst, nn_ts, nn_eidx, nn_label = splits.test_new_new
         if len(nn_src) > 0:
-            [nn_neg_tgt] = _precompute_negatives(
-                [nn_src], [nn_dst], [nn_ts], num_negs=args.negs,
-            )
+            nn_neg_tgt = _sample_negatives(nn_src, nn_dst, nn_ts, args.negs)
             nn_ap, nn_auc = eval_one_epoch(
                 model, nn_neg_tgt, nn_src, nn_dst, nn_ts, nn_label, nn_eidx,
             )
@@ -217,9 +191,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     if splits.test_new_old is not None:
         no_src, no_dst, no_ts, no_eidx, no_label = splits.test_new_old
         if len(no_src) > 0:
-            [no_neg_tgt] = _precompute_negatives(
-                [no_src], [no_dst], [no_ts], num_negs=args.negs,
-            )
+            no_neg_tgt = _sample_negatives(no_src, no_dst, no_ts, args.negs)
             no_ap, no_auc = eval_one_epoch(
                 model, no_neg_tgt, no_src, no_dst, no_ts, no_label, no_eidx,
             )
