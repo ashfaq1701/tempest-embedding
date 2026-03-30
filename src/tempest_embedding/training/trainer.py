@@ -4,10 +4,8 @@ import time
 
 import numpy as np
 import torch
-
 from temporal_negative_edge_sampler import NegativeEdgeSampler
 
-from ..training.evaluator import eval_one_epoch
 from ..utils.misc import EarlyStopMonitor
 from ..walks.batching import WalkBatcher
 from ..walks.tempest import TempestWalkBackend
