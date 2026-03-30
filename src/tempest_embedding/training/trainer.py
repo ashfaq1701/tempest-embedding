@@ -5,52 +5,35 @@ import time
 import numpy as np
 import torch
 
+from temporal_negative_edge_sampler import NegativeEdgeSampler
+
 from ..training.evaluator import eval_one_epoch
-from ..training.negative import RandEdgeSampler
 from ..utils.misc import EarlyStopMonitor
 from ..walks.batching import WalkBatcher
 from ..walks.tempest import TempestWalkBackend
 
 
 def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_path):
-    """Training loop with incremental Tempest ingestion.
+    """Training loop with temporal negative sampling for train/val/test."""
 
-    Per epoch:
-      1. Create a fresh TempestWalkBackend.
-      2. For each chronological batch of --batch_size edges:
-           a. Ingest the batch's edges (cumulative, no eviction).
-           b. Generate walks for all nodes in current graph state.
-           c. Mini-batch over the batch's edges for gradient updates.
-      3. Validate via eval_one_epoch; checkpoint + early stopping.
-
-    After training: load best model, build train+val graph, evaluate on test set.
-
-    Returns: dict with test_ap, test_auc (and optionally nn_ap/auc, no_ap/auc
-             for inductive splits).
-    """
-    device = next(model.parameters()).device
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # ------------------------------------------------------------------
     # Unpack & sort training edges by timestamp
     # ------------------------------------------------------------------
-    train_src, train_dst, train_ts, train_e_idx, train_label = splits.train
+    train_src, train_dst, train_ts, train_e_idx, _ = splits.train
     sort_idx = np.argsort(train_ts)
     train_src = train_src[sort_idx]
     train_dst = train_dst[sort_idx]
     train_ts = train_ts[sort_idx]
     train_e_idx = train_e_idx[sort_idx]
 
+    val_src, val_dst, val_ts, val_e_idx, _ = splits.val
+    test_src, test_dst, test_ts, test_e_idx, _ = splits.test
+
     num_train = len(train_src)
     walk_generator_batch_size = args.walk_generator_batch_size
 
-    val_src, val_dst, val_ts, val_e_idx, val_label = splits.val
-
-    # ------------------------------------------------------------------
-    # Samplers & helpers
-    # ------------------------------------------------------------------
-    train_sampler = RandEdgeSampler([train_src], [train_dst])
-    val_sampler = RandEdgeSampler([train_src, val_src], [train_dst, val_dst])
     batcher = WalkBatcher(args.num_walks_per_node, args.max_walk_len)
     early_stopper = EarlyStopMonitor(higher_better=True, tolerance=args.tolerance)
 
@@ -65,8 +48,14 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         num_batches = 0
         t0 = time.time()
 
-        # Fresh walk backend each epoch (walks are stochastic)
+        # Fresh walk backend and fresh temporal negative sampler per epoch
         backend = TempestWalkBackend(args)
+        train_neg_sampler = NegativeEdgeSampler(
+            is_directed=False,
+            num_negatives_per_positive=args.negs,
+            historical_negative_percentage=0.5,
+            seed=args.seed,
+        )
 
         for b_start in range(0, num_train, walk_generator_batch_size):
             b_end = min(b_start + walk_generator_batch_size, num_train)
@@ -76,30 +65,41 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
             b_ts = train_ts[b_start:b_end]
             b_eidx = train_e_idx[b_start:b_end]
 
-            # Ingest + walk generation per batch
+            # Ingest current batch into graph state
             _ingest_edges(backend, b_src, b_dst, b_ts, b_eidx, dataset)
 
+            # Generate walks for current graph state
             nodes, times, lens, edge_feats = backend.generate_walks()
             nodes, times, lens, edge_feats = batcher.reshape_walks(
                 nodes, times, lens, edge_feats,
             )
             model.set_walks(nodes, times, lens, edge_feats)
 
-            # Mini-batch training over this batch's edges
-            n_edges = b_end - b_start
+            # Temporal negatives for this batch
+            train_neg_sampler.add_batch(b_src, b_dst, b_ts)
+            neg_out = train_neg_sampler.sample_negatives()
+
+            neg_targets = np.asarray(neg_out["targets"]).reshape(len(b_src), args.negs)
+
+            # Drop rows containing invalid sentinel negatives (-1)
+            valid_rows = np.all(neg_targets != -1, axis=1)
+            if not np.any(valid_rows):
+                continue
+
+            b_src_valid = b_src[valid_rows]
+            b_dst_valid = b_dst[valid_rows]
+            neg_targets_valid = neg_targets[valid_rows]
+
+            n_edges = len(b_src_valid)
             perm = np.random.permutation(n_edges)
 
             for mb_start in range(0, n_edges, args.bs):
                 mb_end = min(mb_start + args.bs, n_edges)
                 mb_idx = perm[mb_start:mb_end]
 
-                src_mb = b_src[mb_idx]
-                dst_mb = b_dst[mb_idx]
-
-                neg_mb = np.stack(
-                    [train_sampler.sample(len(src_mb))[1] for _ in range(args.negs)],
-                    axis=1,
-                )
+                src_mb = b_src_valid[mb_idx]
+                dst_mb = b_dst_valid[mb_idx]
+                neg_mb = neg_targets_valid[mb_idx]
 
                 optimizer.zero_grad()
                 loss = model.contrast(src_mb, dst_mb, neg_mb)
@@ -112,10 +112,30 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         avg_loss = epoch_loss / max(num_batches, 1)
 
         # ----------------------------------------------------------
-        # Validation (walks are from the last batch = full train graph)
+        # Validation
+        # Current walk state after training epoch corresponds to full train graph
+        # Build a temporal negative sampler on train history, then evaluate val
         # ----------------------------------------------------------
-        val_ap, val_auc = eval_one_epoch(
-            model, val_sampler, val_src, val_dst, val_ts, val_label, val_e_idx,
+        val_neg_sampler = NegativeEdgeSampler(
+            is_directed=False,
+            num_negatives_per_positive=1,
+            historical_negative_percentage=0.5,
+            seed=args.seed,
+        )
+        val_neg_sampler.add_batch(train_src, train_dst, train_ts)
+        val_neg_sampler.sample_negatives()  # commit train edges to sampler history
+
+        def sample_val_neg(size: int) -> np.ndarray:
+            # Consume val edges sequentially in chunks aligned with evaluator calls
+            raise RuntimeError("sample_val_neg should be chunk-driven; use eval_with_temporal_sampler")
+
+        val_ap, val_auc = eval_with_temporal_sampler(
+            model=model,
+            src=val_src,
+            dst=val_dst,
+            ts=val_ts,
+            e_idx=val_e_idx,
+            sampler=val_neg_sampler,
         )
 
         logger.info(
@@ -124,7 +144,6 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
             f'time {time.time() - t0:.1f}s'
         )
 
-        # Checkpoint
         torch.save(model.state_dict(), get_checkpoint_path(epoch))
         if val_ap > best_ap:
             best_ap = val_ap
@@ -141,9 +160,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
     model.eval()
 
-    test_src, test_dst, test_ts, test_e_idx, test_label = splits.test
-
-    # Graph state for test: train + val edges
+    # Graph state for test = train + val
     test_backend = TempestWalkBackend(args)
     _ingest_edges(test_backend, train_src, train_dst, train_ts, train_e_idx, dataset)
     _ingest_edges(test_backend, val_src, val_dst, val_ts, val_e_idx, dataset)
@@ -154,42 +171,93 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     )
     model.set_walks(nodes, times, lens, edge_feats)
 
-    test_sampler = RandEdgeSampler(
-        [train_src, val_src, test_src],
-        [train_dst, val_dst, test_dst],
+    test_neg_sampler = NegativeEdgeSampler(
+        is_directed=False,
+        num_negatives_per_positive=1,
+        historical_negative_percentage=0.5,
+        seed=args.seed,
     )
-    test_ap, test_auc = eval_one_epoch(
-        model, test_sampler, test_src, test_dst, test_ts, test_label, test_e_idx,
+    test_neg_sampler.add_batch(train_src, train_dst, train_ts)
+    test_neg_sampler.sample_negatives()  # commit train
+    test_neg_sampler.add_batch(val_src, val_dst, val_ts)
+    test_neg_sampler.sample_negatives()  # commit val
+
+    test_ap, test_auc = eval_with_temporal_sampler(
+        model=model,
+        src=test_src,
+        dst=test_dst,
+        ts=test_ts,
+        e_idx=test_e_idx,
+        sampler=test_neg_sampler,
     )
+
     logger.info(f'Test AP {test_ap:.4f} | Test AUC {test_auc:.4f}')
 
-    results = {'test_ap': test_ap, 'test_auc': test_auc}
-
-    # Inductive sub-splits (if present)
-    if splits.test_new_new is not None:
-        nn_src, nn_dst, nn_ts, nn_eidx, nn_label = splits.test_new_new
-        if len(nn_src) > 0:
-            nn_sampler = RandEdgeSampler([nn_src], [nn_dst])
-            nn_ap, nn_auc = eval_one_epoch(
-                model, nn_sampler, nn_src, nn_dst, nn_ts, nn_label, nn_eidx,
-            )
-            logger.info(f'Test new-new  AP {nn_ap:.4f} | AUC {nn_auc:.4f}')
-            results['nn_ap'], results['nn_auc'] = nn_ap, nn_auc
-
-    if splits.test_new_old is not None:
-        no_src, no_dst, no_ts, no_eidx, no_label = splits.test_new_old
-        if len(no_src) > 0:
-            no_sampler = RandEdgeSampler([no_src], [no_dst])
-            no_ap, no_auc = eval_one_epoch(
-                model, no_sampler, no_src, no_dst, no_ts, no_label, no_eidx,
-            )
-            logger.info(f'Test new-old  AP {no_ap:.4f} | AUC {no_auc:.4f}')
-            results['no_ap'], results['no_auc'] = no_ap, no_auc
+    results = {
+        'test_ap': test_ap,
+        'test_auc': test_auc,
+    }
 
     return results
 
 
+def eval_with_temporal_sampler(model, src, dst, ts, e_idx, sampler):
+    """Evaluate sequentially using the temporal negative sampler.
+
+    Assumes sampler already contains all prior history before this split.
+    """
+    import math
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    test_batch_size = 32
+    aps, aucs = [], []
+
+    with torch.no_grad():
+        model.eval()
+        num_instances = len(src)
+        num_batches = math.ceil(num_instances / test_batch_size)
+
+        for k in range(num_batches):
+            s_idx = k * test_batch_size
+            e_idx_batch = min(num_instances, s_idx + test_batch_size)
+            if s_idx >= e_idx_batch:
+                continue
+
+            src_cut = src[s_idx:e_idx_batch]
+            dst_cut = dst[s_idx:e_idx_batch]
+            ts_cut = ts[s_idx:e_idx_batch]
+            edge_idx_cut = e_idx[s_idx:e_idx_batch] if e_idx is not None else None
+
+            sampler.add_batch(src_cut, dst_cut, ts_cut)
+            neg_out = sampler.sample_negatives()
+
+            neg_tgt = np.asarray(neg_out["targets"]).reshape(len(src_cut), 1).squeeze(1)
+
+            # keep only rows with a valid sampled negative
+            valid = neg_tgt != -1
+            if not np.any(valid):
+                continue
+
+            src_eval = src_cut[valid]
+            dst_eval = dst_cut[valid]
+            ts_eval = ts_cut[valid]
+            edge_idx_eval = edge_idx_cut[valid] if edge_idx_cut is not None else None
+            neg_eval = neg_tgt[valid]
+
+            pos_prob, neg_prob = model.inference(
+                src_eval, dst_eval, neg_eval, ts_eval, edge_idx_eval
+            )
+
+            pred_score = np.concatenate([pos_prob.cpu().numpy(), neg_prob.cpu().numpy()])
+            true_label = np.concatenate([np.ones(len(src_eval)), np.zeros(len(src_eval))])
+
+            aps.append(average_precision_score(true_label, pred_score))
+            aucs.append(roc_auc_score(true_label, pred_score))
+
+    return float(np.mean(aps)), float(np.mean(aucs))
+
+
 def _ingest_edges(backend, src, dst, ts, e_idx, dataset):
-    """Add a set of edges (with their features) into the Tempest backend."""
+    """Add edges (with features) into Tempest backend."""
     efeat = dataset.e_feat[e_idx] if dataset.e_feat is not None else None
     backend.add_edges(src, dst, ts, efeat)

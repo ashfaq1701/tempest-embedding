@@ -86,7 +86,11 @@ class NeurTWs(nn.Module):
         else:
             self._walk_edge_feats = None
 
-        root_ids = nodes[:, 0, 0]
+        root_ids = nodes[
+            np.arange(nodes.shape[0]),
+            0,
+            np.maximum(lens[:, 0] - 1, 0)
+        ]
         self._node2idx = {int(nid): i for i, nid in enumerate(root_ids)}
 
     def _get_walks(self, node_ids):
