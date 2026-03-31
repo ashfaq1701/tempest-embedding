@@ -1,3 +1,5 @@
+from time import perf_counter
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -84,48 +86,76 @@ class NeurTWs(nn.Module):
         )
 
     def _compute_pair_embeddings(self, src_walks, tgt_walks):
+        timing = {'position': 0.0, 'model': 0.0}
         src_n, src_t, src_l, src_ef = src_walks
         tgt_n, tgt_t, tgt_l, tgt_ef = tgt_walks
 
+        t0 = perf_counter()
         src_pos, tgt_pos = self.pos_encoder(src_n, tgt_n, src_l, tgt_l)
+        timing['position'] += perf_counter() - t0
 
         if self.mutual:
+            t0 = perf_counter()
             src_walk_emb = self._encode_walks(src_n, src_t, src_l, src_ef, src_pos, pool=False)
             tgt_walk_emb = self._encode_walks(tgt_n, tgt_t, tgt_l, tgt_ef, tgt_pos, pool=False)
-            return self.walk_encoder.mutual_query(src_walk_emb, tgt_walk_emb)
+            src_emb, tgt_emb = self.walk_encoder.mutual_query(src_walk_emb, tgt_walk_emb)
+            timing['model'] += perf_counter() - t0
+            return src_emb, tgt_emb, timing
 
+        t0 = perf_counter()
         src_emb = self._encode_walks(src_n, src_t, src_l, src_ef, src_pos)
         tgt_emb = self._encode_walks(tgt_n, tgt_t, tgt_l, tgt_ef, tgt_pos)
-        return src_emb, tgt_emb
+        timing['model'] += perf_counter() - t0
+        return src_emb, tgt_emb, timing
 
     def _encode_with_cross(self, node_walks, cross_walks):
+        timing = {'position': 0.0, 'model': 0.0}
         n, t, l, ef = node_walks
         cross_n, _, cross_l, _ = cross_walks
+
+        t0 = perf_counter()
         _, node_pos = self.pos_encoder(cross_n, n, cross_l, l)
-        return self._encode_walks(n, t, l, ef, node_pos)
+        timing['position'] += perf_counter() - t0
+
+        t0 = perf_counter()
+        emb = self._encode_walks(n, t, l, ef, node_pos)
+        timing['model'] += perf_counter() - t0
+        return emb, timing
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def contrast(self, src_walks, dst_walks, neg_walks_list):
-        src_embed, tgt_embed = self._compute_pair_embeddings(src_walks, dst_walks)
+        timing = {'position': 0.0, 'model': 0.0}
 
+        src_embed, tgt_embed, pair_timing = self._compute_pair_embeddings(src_walks, dst_walks)
+        timing['position'] += pair_timing['position']
+        timing['model'] += pair_timing['model']
+
+        t0 = perf_counter()
         pos_logit, _ = self.affinity_score(src_embed, tgt_embed)
         pos_score = torch.exp(pos_logit / self.tau)
 
         neg_score_sum = torch.zeros_like(pos_score)
+        timing['model'] += perf_counter() - t0
+
         for neg_walks in neg_walks_list:
-            neg_embed = self._encode_with_cross(neg_walks, src_walks)
+            neg_embed, neg_timing = self._encode_with_cross(neg_walks, src_walks)
+            timing['position'] += neg_timing['position']
+            timing['model'] += neg_timing['model']
+
+            t0 = perf_counter()
             neg_logit, _ = self.affinity_score(src_embed, neg_embed)
             neg_score_sum = neg_score_sum + torch.exp(neg_logit / self.tau)
+            timing['model'] += perf_counter() - t0
 
         loss = -torch.log(pos_score / (pos_score + neg_score_sum + 1e-8))
-        return loss.mean()
+        return loss.mean(), timing
 
     def inference(self, src_walks, dst_walks, neg_walks):
-        src_embed, tgt_embed = self._compute_pair_embeddings(src_walks, dst_walks)
-        neg_embed = self._encode_with_cross(neg_walks, src_walks)
+        src_embed, tgt_embed, pair_timing = self._compute_pair_embeddings(src_walks, dst_walks)
+        neg_embed, neg_timing = self._encode_with_cross(neg_walks, src_walks)
 
         pos_logit, _ = self.affinity_score(src_embed, tgt_embed)
         neg_logit, _ = self.affinity_score(src_embed, neg_embed)
