@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 import time
 
 import numpy as np
 import torch
 from temporal_negative_edge_sampler import NegativeEdgeSampler
+from tqdm import tqdm
 
 from ..utils.misc import EarlyStopMonitor, PAD_NODE_ID
 from ..walks.batching import WalkBatcher
@@ -40,7 +42,10 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     # ------------------------------------------------------------------
     # Epoch loop
     # ------------------------------------------------------------------
-    for epoch in range(args.n_epoch):
+    num_walk_batches = math.ceil(num_train / walk_generator_batch_size)
+
+    epoch_pbar = tqdm(range(args.n_epoch), desc='Training', unit='epoch')
+    for epoch in epoch_pbar:
         model.train()
         epoch_loss = 0.0
         num_batches = 0
@@ -55,7 +60,14 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
             seed=args.seed,
         )
 
-        for b_start in range(0, num_train, walk_generator_batch_size):
+        batch_pbar = tqdm(
+            range(0, num_train, walk_generator_batch_size),
+            desc=f'  Epoch {epoch}',
+            unit='batch',
+            total=num_walk_batches,
+            leave=False,
+        )
+        for b_start in batch_pbar:
             b_end = min(b_start + walk_generator_batch_size, num_train)
 
             b_src = train_src[b_start:b_end]
@@ -107,6 +119,11 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
                 epoch_loss += loss.item()
                 num_batches += 1
 
+            # Update batch progress bar with running loss
+            running_loss = epoch_loss / max(num_batches, 1)
+            batch_pbar.set_postfix(loss=f'{running_loss:.4f}')
+
+        batch_pbar.close()
         avg_loss = epoch_loss / max(num_batches, 1)
 
         # ----------------------------------------------------------
@@ -134,12 +151,19 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
             ts=val_ts,
             e_idx=val_e_idx,
             sampler=val_neg_sampler,
+            desc='Validation',
         )
 
+        epoch_time = time.time() - t0
+        epoch_pbar.set_postfix(
+            loss=f'{avg_loss:.4f}',
+            val_ap=f'{val_ap:.4f}',
+            val_auc=f'{val_auc:.4f}',
+        )
         logger.info(
             f'Epoch {epoch:3d} | loss {avg_loss:.4f} | '
             f'val AP {val_ap:.4f} | val AUC {val_auc:.4f} | '
-            f'time {time.time() - t0:.1f}s'
+            f'time {epoch_time:.1f}s'
         )
 
         torch.save(model.state_dict(), get_checkpoint_path(epoch))
@@ -187,6 +211,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         ts=test_ts,
         e_idx=test_e_idx,
         sampler=test_neg_sampler,
+        desc='Testing',
     )
 
     logger.info(f'Test AP {test_ap:.4f} | Test AUC {test_auc:.4f}')
@@ -199,12 +224,11 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     return results
 
 
-def eval_with_temporal_sampler(model, src, dst, ts, e_idx, sampler):
+def eval_with_temporal_sampler(model, src, dst, ts, e_idx, sampler, desc='Evaluating'):
     """Evaluate sequentially using the temporal negative sampler.
 
     Assumes sampler already contains all prior history before this split.
     """
-    import math
     from sklearn.metrics import average_precision_score, roc_auc_score
 
     test_batch_size = 32
@@ -215,7 +239,8 @@ def eval_with_temporal_sampler(model, src, dst, ts, e_idx, sampler):
         num_instances = len(src)
         num_batches = math.ceil(num_instances / test_batch_size)
 
-        for k in range(num_batches):
+        eval_pbar = tqdm(range(num_batches), desc=f'  {desc}', unit='batch', leave=False)
+        for k in eval_pbar:
             s_idx = k * test_batch_size
             e_idx_batch = min(num_instances, s_idx + test_batch_size)
             if s_idx >= e_idx_batch:
@@ -251,6 +276,14 @@ def eval_with_temporal_sampler(model, src, dst, ts, e_idx, sampler):
 
             aps.append(average_precision_score(true_label, pred_score))
             aucs.append(roc_auc_score(true_label, pred_score))
+
+            if aps:
+                eval_pbar.set_postfix(
+                    ap=f'{np.mean(aps):.4f}',
+                    auc=f'{np.mean(aucs):.4f}',
+                )
+
+        eval_pbar.close()
 
     return float(np.mean(aps)), float(np.mean(aucs))
 
