@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import math
+import time
+
 import numpy as np
 import torch
 from temporal_negative_edge_sampler import NegativeEdgeSampler
+from tqdm import tqdm
 
 from ..training.evaluator import eval_one_epoch
 from ..utils.misc import EarlyStopMonitor
@@ -43,10 +47,14 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     early_stopper = EarlyStopMonitor(higher_better=True, tolerance=args.tolerance)
     best_ap = 0.0
 
-    for epoch in range(args.n_epoch):
+    num_walk_batches = math.ceil(num_train / walk_generator_batch_size)
+
+    epoch_pbar = tqdm(range(args.n_epoch), desc='Training', unit='epoch')
+    for epoch in epoch_pbar:
         model.train()
         epoch_loss = 0.0
         num_batches = 0
+        t0 = time.time()
 
         walk_store = TemporalWalkStore(args, device=device)
         train_neg_sampler = NegativeEdgeSampler(
@@ -56,7 +64,14 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
             seed=args.seed,
         )
 
-        for b_start in range(0, num_train, walk_generator_batch_size):
+        batch_pbar = tqdm(
+            range(0, num_train, walk_generator_batch_size),
+            desc=f'  Epoch {epoch}',
+            unit='batch',
+            total=num_walk_batches,
+            leave=False,
+        )
+        for b_start in batch_pbar:
             b_end = min(b_start + walk_generator_batch_size, num_train)
 
             b_src = train_src[b_start:b_end]
@@ -102,6 +117,11 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
                 epoch_loss += loss.item()
                 num_batches += 1
 
+            # Update batch progress bar with running loss
+            running_loss = epoch_loss / max(num_batches, 1)
+            batch_pbar.set_postfix(loss=f'{running_loss:.4f}')
+
+        batch_pbar.close()
         avg_loss = epoch_loss / max(num_batches, 1)
 
         val_walk_store = TemporalWalkStore(args, device=device)
@@ -125,11 +145,19 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
             dst=val_dst,
             ts=val_ts,
             val_e_idx_l=val_e_idx,
+            desc='Validation',
         )
 
+        epoch_time = time.time() - t0
+        epoch_pbar.set_postfix(
+            loss=f'{avg_loss:.4f}',
+            val_ap=f'{val_ap:.4f}',
+            val_auc=f'{val_auc:.4f}',
+        )
         logger.info(
             f'Epoch {epoch:3d} | loss {avg_loss:.4f} | '
-            f'val AP {val_ap:.4f} | val AUC {val_auc:.4f}'
+            f'val AP {val_ap:.4f} | val AUC {val_auc:.4f} | '
+            f'time {epoch_time:.1f}s'
         )
 
         torch.save(model.state_dict(), get_checkpoint_path(epoch))
@@ -169,6 +197,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         dst=test_dst,
         ts=test_ts,
         val_e_idx_l=test_e_idx,
+        desc='Testing',
     )
 
     logger.info(f'Test AP {test_ap:.4f} | Test AUC {test_auc:.4f}')

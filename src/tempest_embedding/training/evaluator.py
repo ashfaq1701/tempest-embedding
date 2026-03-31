@@ -5,10 +5,11 @@ import math
 import numpy as np
 import torch
 from sklearn.metrics import average_precision_score, roc_auc_score
+from tqdm import tqdm
 
 TEST_BATCH_SIZE = 32
 
-def eval_one_epoch(model, walk_store, neg_sampler, src, dst, ts, val_e_idx_l=None):
+def eval_one_epoch(model, walk_store, neg_sampler, src, dst, ts, val_e_idx_l=None, desc='Evaluating'):
     val_ap, val_auc = [], []
 
     with torch.no_grad():
@@ -16,7 +17,8 @@ def eval_one_epoch(model, walk_store, neg_sampler, src, dst, ts, val_e_idx_l=Non
         num_test_instance = len(src)
         num_test_batch = math.ceil(num_test_instance / TEST_BATCH_SIZE)
 
-        for k in range(num_test_batch):
+        eval_pbar = tqdm(range(num_test_batch), desc=f'  {desc}', unit='batch', leave=False)
+        for k in eval_pbar:
             s_idx = k * TEST_BATCH_SIZE
             e_idx = min(num_test_instance, s_idx + TEST_BATCH_SIZE)
 
@@ -70,5 +72,13 @@ def eval_one_epoch(model, walk_store, neg_sampler, src, dst, ts, val_e_idx_l=Non
 
             val_ap.append(average_precision_score(true_label, pred_score))
             val_auc.append(roc_auc_score(true_label, pred_score))
+
+            if val_ap:
+                eval_pbar.set_postfix(
+                    ap=f'{np.mean(val_ap):.4f}',
+                    auc=f'{np.mean(val_auc):.4f}',
+                )
+
+        eval_pbar.close()
 
     return float(np.mean(val_ap)), float(np.mean(val_auc))
