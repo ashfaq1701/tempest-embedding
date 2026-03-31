@@ -136,22 +136,91 @@ class NeurTWs(nn.Module):
         t0 = perf_counter()
         pos_logit, _ = self.affinity_score(src_embed, tgt_embed)
         pos_score = torch.exp(pos_logit / self.tau)
-
-        neg_score_sum = torch.zeros_like(pos_score)
         timing['model'] += perf_counter() - t0
+        if len(neg_walks_list) == 0:
+            neg_score_sum = torch.zeros_like(pos_score)
+        else:
+            t0 = perf_counter()
+            neg_walks = self._merge_negative_walks(neg_walks_list)
+            src_repeated = self._repeat_walks(src_walks, repeats=len(neg_walks_list))
+            timing['model'] += perf_counter() - t0
 
-        for neg_walks in neg_walks_list:
-            neg_embed, neg_timing = self._encode_with_cross(neg_walks, src_walks)
+            neg_embed, neg_timing = self._encode_with_cross(neg_walks, src_repeated)
             timing['position'] += neg_timing['position']
             timing['model'] += neg_timing['model']
 
+            bsz = src_embed.shape[0]
+            n_negs = len(neg_walks_list)
+            out_dim = src_embed.shape[-1]
+
             t0 = perf_counter()
-            neg_logit, _ = self.affinity_score(src_embed, neg_embed)
-            neg_score_sum = neg_score_sum + torch.exp(neg_logit / self.tau)
+            src_flat = (
+                src_embed.unsqueeze(1)
+                .expand(bsz, n_negs, out_dim)
+                .reshape(bsz * n_negs, out_dim)
+            )
+            neg_logit, _ = self.affinity_score(src_flat, neg_embed)
+            neg_score = torch.exp(neg_logit / self.tau).reshape(bsz, n_negs, 1)
+            neg_score_sum = neg_score.sum(dim=1)
             timing['model'] += perf_counter() - t0
 
         loss = -torch.log(pos_score / (pos_score + neg_score_sum + 1e-8))
         return loss.mean(), timing
+
+    def _merge_negative_walks(self, neg_walks_list):
+        neg_nodes = torch.stack([walks[0] for walks in neg_walks_list], dim=1)
+        neg_times = torch.stack([walks[1] for walks in neg_walks_list], dim=1)
+        neg_lens = torch.stack([walks[2] for walks in neg_walks_list], dim=1)
+
+        if neg_walks_list[0][3] is None:
+            neg_edge_feats = None
+        else:
+            neg_edge_feats = torch.stack([walks[3] for walks in neg_walks_list], dim=1)
+
+        bsz, n_negs, k_walks, walk_len = neg_nodes.shape
+        neg_nodes = neg_nodes.reshape(bsz * n_negs, k_walks, walk_len)
+        neg_times = neg_times.reshape(bsz * n_negs, k_walks, walk_len)
+        neg_lens = neg_lens.reshape(bsz * n_negs, k_walks)
+
+        if neg_edge_feats is not None:
+            neg_edge_feats = neg_edge_feats.reshape(
+                bsz * n_negs,
+                k_walks,
+                walk_len - 1,
+                neg_edge_feats.shape[-1],
+            )
+        return neg_nodes, neg_times, neg_lens, neg_edge_feats
+
+    def _repeat_walks(self, walks, repeats):
+        nodes, times, lens, edge_feats = walks
+        bsz, k_walks, walk_len = nodes.shape
+
+        nodes = nodes.unsqueeze(1).expand(bsz, repeats, k_walks, walk_len)
+        times = times.unsqueeze(1).expand(bsz, repeats, k_walks, walk_len)
+        lens = lens.unsqueeze(1).expand(bsz, repeats, k_walks)
+
+        nodes = nodes.reshape(bsz * repeats, k_walks, walk_len)
+        times = times.reshape(bsz * repeats, k_walks, walk_len)
+        lens = lens.reshape(bsz * repeats, k_walks)
+
+        if edge_feats is None:
+            repeated_edge_feats = None
+        else:
+            repeated_edge_feats = edge_feats.unsqueeze(1).expand(
+                bsz,
+                repeats,
+                k_walks,
+                walk_len - 1,
+                edge_feats.shape[-1],
+            )
+            repeated_edge_feats = repeated_edge_feats.reshape(
+                bsz * repeats,
+                k_walks,
+                walk_len - 1,
+                edge_feats.shape[-1],
+            )
+
+        return nodes, times, lens, repeated_edge_feats
 
     def inference(self, src_walks, dst_walks, neg_walks):
         src_embed, tgt_embed, pair_timing = self._compute_pair_embeddings(src_walks, dst_walks)
