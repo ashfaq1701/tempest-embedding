@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-import time
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -49,12 +49,15 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
 
     num_walk_batches = math.ceil(num_train / walk_generator_batch_size)
 
+    total_stats = {'walk': 0.0, 'position': 0.0, 'model': 0.0, 'eval': 0.0}
+
     epoch_pbar = tqdm(range(args.n_epoch), desc='Training', unit='epoch')
     for epoch in epoch_pbar:
         model.train()
         epoch_loss = 0.0
         num_batches = 0
-        t0 = time.time()
+        epoch_stats = {k: 0.0 for k in total_stats}
+        epoch_start = perf_counter()
 
         walk_store = TemporalWalkStore(args, device=device)
         train_neg_sampler = NegativeEdgeSampler(
@@ -79,8 +82,10 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
             b_ts = train_ts[b_start:b_end]
             b_eidx = train_e_idx[b_start:b_end]
 
+            t0 = perf_counter()
             _ingest_edges(walk_store, b_src, b_dst, b_ts, b_eidx, dataset)
             walk_store.build()
+            epoch_stats['walk'] += perf_counter() - t0
 
             train_neg_sampler.add_batch(b_src, b_dst, b_ts)
             neg_out = train_neg_sampler.sample_negatives()
@@ -105,14 +110,21 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
                 dst_mb = b_dst_valid[mb_idx]
                 neg_mb = neg_targets_valid[mb_idx]
 
+                t0 = perf_counter()
                 src_walks = walk_store.get(src_mb)
                 dst_walks = walk_store.get(dst_mb)
                 neg_walks_list = [walk_store.get(neg_mb[:, i]) for i in range(neg_mb.shape[1])]
+                epoch_stats['walk'] += perf_counter() - t0
 
                 optimizer.zero_grad()
-                loss = model.contrast(src_walks, dst_walks, neg_walks_list)
+                loss, contrast_timing = model.contrast(src_walks, dst_walks, neg_walks_list)
+                epoch_stats['position'] += contrast_timing['position']
+                epoch_stats['model'] += contrast_timing['model']
+
+                t0 = perf_counter()
                 loss.backward()
                 optimizer.step()
+                epoch_stats['model'] += perf_counter() - t0
 
                 epoch_loss += loss.item()
                 num_batches += 1
@@ -124,6 +136,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         batch_pbar.close()
         avg_loss = epoch_loss / max(num_batches, 1)
 
+        t0 = perf_counter()
         val_walk_store = TemporalWalkStore(args, device=device)
         _ingest_edges(val_walk_store, train_src, train_dst, train_ts, train_e_idx, dataset)
         val_walk_store.build()
@@ -147,8 +160,12 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
             val_e_idx_l=val_e_idx,
             desc='Validation',
         )
+        epoch_stats['eval'] += perf_counter() - t0
 
-        epoch_time = time.time() - t0
+        epoch_total = perf_counter() - epoch_start
+        for key in total_stats:
+            total_stats[key] += epoch_stats[key]
+
         epoch_pbar.set_postfix(
             loss=f'{avg_loss:.4f}',
             val_ap=f'{val_ap:.4f}',
@@ -156,8 +173,15 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         )
         logger.info(
             f'Epoch {epoch:3d} | loss {avg_loss:.4f} | '
-            f'val AP {val_ap:.4f} | val AUC {val_auc:.4f} | '
-            f'time {epoch_time:.1f}s'
+            f'val AP {val_ap:.4f} | val AUC {val_auc:.4f}'
+        )
+        logger.info(
+            f'  Epoch {epoch} Timing:\n'
+            f'    Walk/Lookup:  {epoch_stats["walk"]:.2f}s\n'
+            f'    Position Enc: {epoch_stats["position"]:.2f}s\n'
+            f'    Model Ops:    {epoch_stats["model"]:.2f}s\n'
+            f'    Eval:         {epoch_stats["eval"]:.2f}s\n'
+            f'    Total:        {epoch_total:.2f}s'
         )
 
         torch.save(model.state_dict(), get_checkpoint_path(epoch))
@@ -169,6 +193,14 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         if early_stopper.early_stop_check(val_ap):
             logger.info(f'Early stopping at epoch {epoch}')
             break
+
+    logger.info(
+        f'Total Timing:\n'
+        f'    Walk/Lookup:  {total_stats["walk"]:.2f}s\n'
+        f'    Position Enc: {total_stats["position"]:.2f}s\n'
+        f'    Model Ops:    {total_stats["model"]:.2f}s\n'
+        f'    Eval:         {total_stats["eval"]:.2f}s'
+    )
 
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
     model.eval()
