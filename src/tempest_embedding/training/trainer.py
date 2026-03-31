@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from temporal_negative_edge_sampler import NegativeEdgeSampler
 
-from ..utils.misc import EarlyStopMonitor
+from ..utils.misc import EarlyStopMonitor, PAD_NODE_ID
 from ..walks.batching import WalkBatcher
 from ..walks.tempest import TempestWalkBackend
 
@@ -79,8 +79,8 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
 
             neg_targets = np.asarray(neg_out["targets"]).reshape(len(b_src), args.negs)
 
-            # Drop rows containing invalid sentinel negatives (-1)
-            valid_rows = np.all(neg_targets != -1, axis=1)
+            # Drop rows containing invalid sentinel negatives.
+            valid_rows = np.all(neg_targets != PAD_NODE_ID, axis=1)
             if not np.any(valid_rows):
                 continue
 
@@ -232,7 +232,7 @@ def eval_with_temporal_sampler(model, src, dst, ts, e_idx, sampler):
             neg_tgt = np.asarray(neg_out["targets"]).reshape(len(src_cut), 1).squeeze(1)
 
             # keep only rows with a valid sampled negative
-            valid = neg_tgt != -1
+            valid = neg_tgt != PAD_NODE_ID
             if not np.any(valid):
                 continue
 

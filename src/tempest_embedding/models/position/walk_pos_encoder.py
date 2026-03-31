@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from ...utils.misc import PAD_NODE_ID
+
 
 class WalkPositionEncoder(nn.Module):
     """Walk-native positional encoding using Tempest walk output.
@@ -66,7 +68,7 @@ class WalkPositionEncoder(nn.Module):
         """(B, K, L) bool — True where position is within length and non-padding."""
         B, K, L = walks.shape
         pos_grid = torch.arange(L, device=walks.device).view(1, 1, L)
-        return (pos_grid < lens.unsqueeze(-1)) & (walks != 0)
+        return (pos_grid < lens.unsqueeze(-1)) & (walks != PAD_NODE_ID)
 
     # ------------------------------------------------------------------
     # SAW: first-seen walk position

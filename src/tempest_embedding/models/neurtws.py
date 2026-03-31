@@ -5,6 +5,7 @@ import torch.nn as nn
 from .encoders.walk_encoder import WalkEncoder
 from .layers.merge import MergeLayer
 from .position.walk_pos_encoder import WalkPositionEncoder
+from ..utils.misc import PAD_NODE_ID
 
 
 class NeurTWs(nn.Module):
@@ -91,7 +92,11 @@ class NeurTWs(nn.Module):
             0,
             np.maximum(lens[:, 0] - 1, 0)
         ]
-        self._node2idx = {int(nid): i for i, nid in enumerate(root_ids)}
+        self._node2idx = {
+            int(nid): i
+            for i, nid in enumerate(root_ids)
+            if int(nid) != PAD_NODE_ID
+        }
 
     def _get_walks(self, node_ids):
         """Slice stored walks for a batch of node IDs.
@@ -116,7 +121,7 @@ class NeurTWs(nn.Module):
         """(B, K, L) bool — True for valid (within length, non-padding) positions."""
         B, K, L = walk_nodes.shape
         pos_grid = torch.arange(L, device=walk_nodes.device).view(1, 1, L)
-        return (pos_grid < walk_lens.unsqueeze(-1)) & (walk_nodes != 0)
+        return (pos_grid < walk_lens.unsqueeze(-1)) & (walk_nodes != PAD_NODE_ID)
 
     def _pad_edge_features(self, edge_feats, B, K, L, device):
         """Zero-pad edge features at position 0: (B,K,L-1,E) → (B,K,L,E)."""
@@ -133,7 +138,9 @@ class NeurTWs(nn.Module):
         """
         B, K, L = walk_nodes.shape
         device = walk_nodes.device
-        node_feats = self.node_embedding(walk_nodes)
+        safe_nodes = walk_nodes.clone()
+        safe_nodes[safe_nodes == PAD_NODE_ID] = 0  # map padding -> index 0
+        node_feats = self.node_embedding(safe_nodes)
         edge_feats = self._pad_edge_features(walk_edge_feats, B, K, L, device)
         mask = self._build_mask(walk_nodes, walk_lens)
         return self.walk_encoder.forward_one_node(
