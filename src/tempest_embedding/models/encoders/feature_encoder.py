@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torchdiffeq import odeint_adjoint as odeint
+from time import perf_counter
 
 
 class GRUCell(nn.Module):
@@ -39,7 +40,8 @@ class FeatureEncoder(nn.Module):
     start_time = 0.0
     end_time = 1.0
 
-    def __init__(self, in_features, hidden_features, dropout_p=0.1, solver='rk4', step_size=0.125):
+    def __init__(self, in_features, hidden_features, dropout_p=0.1, solver='rk4', step_size=0.125,
+                 logger=None, encoder_name='feature'):
         super().__init__()
         self.hidden_dim = hidden_features
         if self.hidden_dim == 0:
@@ -50,8 +52,15 @@ class FeatureEncoder(nn.Module):
         self.solver = solver
         if self.solver in {'euler', 'rk4'}:
             self.step_size = step_size
+        self.logger = logger
+        self.encoder_name = encoder_name
+        self._integrate_calls = 0
 
     def integrate(self, t_records, X, mask=None):
+        total_t0 = perf_counter()
+        gru_elapsed = 0.0
+        ode_elapsed = 0.0
+        final_gru_elapsed = 0.0
         batch, n_walk, len_walk, feat_dim = X.shape
         X = X.view(batch * n_walk, len_walk, feat_dim)
         t_records = t_records.view(batch * n_walk, len_walk, 1)
@@ -62,7 +71,9 @@ class FeatureEncoder(nn.Module):
 
         h = torch.zeros(batch * n_walk, self.hidden_dim).type_as(X)
         for i in range(X.shape[1] - 1):
+            step_t0 = perf_counter()
             h_gru = self.gru(X[:, i, :], h)
+            gru_elapsed += perf_counter() - step_t0
             if mask is not None:
                 gru_active = mask[:, i].unsqueeze(-1)       # (BW, 1)
                 h_gru = torch.where(gru_active, h_gru, h)
@@ -72,12 +83,14 @@ class FeatureEncoder(nn.Module):
             delta_t = torch.log10(torch.abs(t1 - t0) + 1.0) + 0.01
             state = (torch.zeros_like(t0), delta_t, h_gru)
             ts = torch.tensor([self.start_time, self.end_time]).type_as(X)
+            step_t0 = perf_counter()
             if self.solver in {'euler', 'rk4'}:
                 solution = odeint(self, state, ts, method=self.solver, options=dict(step_size=self.step_size))
             elif self.solver == 'dopri5':
                 solution = odeint(self, state, ts, method=self.solver)
             else:
                 raise NotImplementedError(f'{self.solver} solver is not implemented.')
+            ode_elapsed += perf_counter() - step_t0
             _, _, h_ode = tuple(s[-1] for s in solution)
 
             if mask is not None:
@@ -88,7 +101,9 @@ class FeatureEncoder(nn.Module):
                 h = h_ode
 
         # Final GRU on last position
+        step_t0 = perf_counter()
         h_final = self.gru(X[:, -1, :], h)
+        final_gru_elapsed = perf_counter() - step_t0
         if mask is not None:
             final_active = mask[:, -1].unsqueeze(-1)
             encoded_features = torch.where(final_active, h_final, h)
@@ -96,6 +111,25 @@ class FeatureEncoder(nn.Module):
             encoded_features = h_final
 
         encoded_features = encoded_features.view(batch, n_walk, self.hidden_dim)
+        self._integrate_calls += 1
+        total_elapsed = perf_counter() - total_t0
+        if self.logger is not None and (total_elapsed > 1.0 or (self._integrate_calls % 100) == 0):
+            self.logger.info(
+                'FeatureEncoder.integrate[%s]: call=%d shape=(%d,%d,%d,%d) solver=%s '
+                'steps=%d total=%.3fs gru=%.3fs ode=%.3fs final_gru=%.3fs',
+                self.encoder_name,
+                self._integrate_calls,
+                batch,
+                n_walk,
+                len_walk,
+                feat_dim,
+                self.solver,
+                max(len_walk - 1, 0),
+                total_elapsed,
+                gru_elapsed,
+                ode_elapsed,
+                final_gru_elapsed,
+            )
         return self.dropout(encoded_features)
 
     def forward(self, s, state):
