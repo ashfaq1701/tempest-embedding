@@ -59,7 +59,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         epoch_stats = {k: 0.0 for k in total_stats}
         epoch_start = perf_counter()
 
-        walk_store = TemporalWalkStore(args, device=device)
+        walk_store = TemporalWalkStore(args, device=device, logger=logger)
         train_neg_sampler = NegativeEdgeSampler(
             is_directed=False,
             num_negatives_per_positive=args.negs,
@@ -76,6 +76,15 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         )
         for b_start in batch_pbar:
             b_end = min(b_start + walk_generator_batch_size, num_train)
+            batch_id = (b_start // walk_generator_batch_size) + 1
+            logger.info(
+                'Epoch %d batch %d/%d: start edges[%d:%d]',
+                epoch,
+                batch_id,
+                num_walk_batches,
+                b_start,
+                b_end,
+            )
 
             b_src = train_src[b_start:b_end]
             b_dst = train_dst[b_start:b_end]
@@ -85,14 +94,37 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
             t0 = perf_counter()
             _ingest_edges(walk_store, b_src, b_dst, b_ts, b_eidx, dataset)
             walk_store.build()
-            epoch_stats['walk'] += perf_counter() - t0
+            walk_stage = perf_counter() - t0
+            epoch_stats['walk'] += walk_stage
+            logger.info(
+                'Epoch %d batch %d/%d: walk_store ready nodes=%d edges=%d elapsed=%.2fs',
+                epoch,
+                batch_id,
+                num_walk_batches,
+                walk_store.get_num_nodes(),
+                walk_store.get_num_edges(),
+                walk_stage,
+            )
 
             train_neg_sampler.add_batch(b_src, b_dst, b_ts)
             neg_out = train_neg_sampler.sample_negatives()
             neg_targets = np.asarray(neg_out["targets"]).reshape(len(b_src), args.negs)
+            logger.info(
+                'Epoch %d batch %d/%d: sampled negatives shape=%s',
+                epoch,
+                batch_id,
+                num_walk_batches,
+                tuple(neg_targets.shape),
+            )
 
             valid_rows = np.all(neg_targets != -1, axis=1)
             if not np.any(valid_rows):
+                logger.warning(
+                    'Epoch %d batch %d/%d: no valid negatives after filtering',
+                    epoch,
+                    batch_id,
+                    num_walk_batches,
+                )
                 continue
 
             b_src_valid = b_src[valid_rows]
@@ -101,6 +133,14 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
 
             n_edges = len(b_src_valid)
             perm = np.random.permutation(n_edges)
+            logger.info(
+                'Epoch %d batch %d/%d: valid_edges=%d mini_batches=%d',
+                epoch,
+                batch_id,
+                num_walk_batches,
+                n_edges,
+                math.ceil(n_edges / args.bs),
+            )
 
             for mb_start in range(0, n_edges, args.bs):
                 mb_end = min(mb_start + args.bs, n_edges)
@@ -114,7 +154,8 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
                 src_walks = walk_store.get(src_mb)
                 dst_walks = walk_store.get(dst_mb)
                 neg_walks_list = [walk_store.get(neg_mb[:, i]) for i in range(neg_mb.shape[1])]
-                epoch_stats['walk'] += perf_counter() - t0
+                fetch_walk_elapsed = perf_counter() - t0
+                epoch_stats['walk'] += fetch_walk_elapsed
 
                 optimizer.zero_grad()
                 loss, contrast_timing = model.contrast(src_walks, dst_walks, neg_walks_list)
@@ -128,6 +169,16 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
 
                 epoch_loss += loss.item()
                 num_batches += 1
+                if (num_batches % 25) == 0:
+                    logger.info(
+                        'Epoch %d progress: opt_steps=%d loss=%.4f walk_fetch=%.3fs position=%.3fs model=%.3fs',
+                        epoch,
+                        num_batches,
+                        epoch_loss / num_batches,
+                        fetch_walk_elapsed,
+                        contrast_timing['position'],
+                        contrast_timing['model'],
+                    )
 
             # Update batch progress bar with running loss
             running_loss = epoch_loss / max(num_batches, 1)
@@ -137,7 +188,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         avg_loss = epoch_loss / max(num_batches, 1)
 
         t0 = perf_counter()
-        val_walk_store = TemporalWalkStore(args, device=device)
+        val_walk_store = TemporalWalkStore(args, device=device, logger=logger)
         _ingest_edges(val_walk_store, train_src, train_dst, train_ts, train_e_idx, dataset)
         val_walk_store.build()
 
@@ -205,7 +256,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
     model.eval()
 
-    test_walk_store = TemporalWalkStore(args, device=device)
+    test_walk_store = TemporalWalkStore(args, device=device, logger=logger)
     _ingest_edges(test_walk_store, train_src, train_dst, train_ts, train_e_idx, dataset)
     _ingest_edges(test_walk_store, val_src, val_dst, val_ts, val_e_idx, dataset)
     test_walk_store.build()

@@ -27,6 +27,8 @@ class NeurTWs(nn.Module):
         self.max_walk_len = max_walk_len
         self.K = num_walks_per_node
         self.mutual = mutual
+        self.logger = logger
+        self._contrast_calls = 0
 
         self.node_embedding = nn.Embedding.from_pretrained(
             torch.from_numpy(n_feat).float(), freeze=True
@@ -127,6 +129,7 @@ class NeurTWs(nn.Module):
     # ------------------------------------------------------------------
 
     def contrast(self, src_walks, dst_walks, neg_walks_list):
+        t0_total = perf_counter()
         timing = {'position': 0.0, 'model': 0.0}
 
         src_embed, tgt_embed, pair_timing = self._compute_pair_embeddings(src_walks, dst_walks)
@@ -151,6 +154,18 @@ class NeurTWs(nn.Module):
             timing['model'] += perf_counter() - t0
 
         loss = -torch.log(pos_score / (pos_score + neg_score_sum + 1e-8))
+        self._contrast_calls += 1
+        total_elapsed = perf_counter() - t0_total
+        if self.logger is not None and (total_elapsed > 2.0 or (self._contrast_calls % 50) == 0):
+            self.logger.info(
+                'NeurTWs.contrast: call=%d batch=%d negs=%d total=%.3fs position=%.3fs model=%.3fs',
+                self._contrast_calls,
+                src_walks[0].shape[0],
+                len(neg_walks_list),
+                total_elapsed,
+                timing['position'],
+                timing['model'],
+            )
         return loss.mean(), timing
 
     def inference(self, src_walks, dst_walks, neg_walks):

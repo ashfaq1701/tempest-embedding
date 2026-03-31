@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from time import perf_counter
 
 from temporal_random_walk import TemporalRandomWalk
 
@@ -20,9 +21,10 @@ class TemporalWalkStore:
     the reshaped walk rows.
     """
 
-    def __init__(self, args, device: torch.device | None = None):
+    def __init__(self, args, device: torch.device | None = None, logger=None):
         self.args = args
         self.device = device or torch.device('cpu')
+        self.logger = logger
 
         enable_weight = args.walk_bias in ["ExponentialWeight", "SpatioTemporal"]
         enable_tn2v = args.walk_bias == "TemporalNode2Vec"
@@ -51,6 +53,7 @@ class TemporalWalkStore:
     # ------------------------------------------------------------------
 
     def add_edges(self, src, dst, ts, edge_feats=None):
+        t0 = perf_counter()
         if edge_feats is not None:
             edge_feats = edge_feats.astype(np.float32)
 
@@ -60,12 +63,24 @@ class TemporalWalkStore:
             ts.astype(np.int64),
             edge_feats,
         )
+        if self.logger is not None:
+            self.logger.info(
+                'TemporalWalkStore.add_edges: added=%d range_ts=[%s, %s] edge_feat=%s elapsed=%.2fs',
+                len(src),
+                int(ts.min()) if len(ts) else 'NA',
+                int(ts.max()) if len(ts) else 'NA',
+                edge_feats is not None,
+                perf_counter() - t0,
+            )
 
     # ------------------------------------------------------------------
     # Walk generation
     # ------------------------------------------------------------------
 
     def build(self):
+        t0 = perf_counter()
+        if self.logger is not None:
+            self.logger.info('TemporalWalkStore.build: starting walk generation (walk_len=%d walks_per_node=%d)', self.args.max_walk_len, self.args.num_walks_per_node)
         nodes, times, lens, edge_feats = self.trw.get_random_walks_and_times_for_all_nodes(
             max_walk_len=self.args.max_walk_len,
             walk_bias=self.args.walk_bias,
@@ -112,6 +127,17 @@ class TemporalWalkStore:
             device=self.device,
         )
         self.node_index[self.node_ids] = torch.arange(N, device=self.device)
+
+        if self.logger is not None:
+            self.logger.info(
+                'TemporalWalkStore.build: done nodes=%d walks=%d tensor_nodes=%s tensor_times=%s edge_feats=%s elapsed=%.2fs',
+                N,
+                expected_num_walks,
+                tuple(self.nodes.shape),
+                tuple(self.times.shape),
+                tuple(self.edge_feats.shape) if self.edge_feats is not None else None,
+                perf_counter() - t0,
+            )
 
     # ------------------------------------------------------------------
     # Lookup
