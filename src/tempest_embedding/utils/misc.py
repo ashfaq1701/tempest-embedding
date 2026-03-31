@@ -8,6 +8,7 @@ import numpy as np
 
 
 DEFAULT_DATASETS = ['CollegeMsg', 'enron', 'TaobaoSmall', 'mooc', 'wikipedia', 'reddit']
+PAD_NODE_ID = 0  # change to -1 later if needed
 
 
 def process_sampling_numbers(num_neighbors, num_layers):

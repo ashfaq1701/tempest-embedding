@@ -6,6 +6,8 @@ import numpy as np
 import torch
 from sklearn.metrics import average_precision_score, roc_auc_score
 
+from ..utils.misc import PAD_NODE_ID
+
 TEST_BATCH_SIZE = 32
 
 
@@ -44,9 +46,9 @@ def eval_one_epoch(model, neg_sampler, src, dst, ts, val_e_idx_l=None):
             neg_targets = neg_targets[:, 0]
 
             # --------------------------------------------------
-            # Filter invalid sentinel negatives (-1)
+            # Filter invalid sentinel negatives.
             # --------------------------------------------------
-            valid_mask = neg_targets != -1
+            valid_mask = neg_targets != PAD_NODE_ID
 
             if not np.any(valid_mask):
                 continue
