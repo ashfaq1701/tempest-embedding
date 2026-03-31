@@ -6,12 +6,9 @@ import numpy as np
 import torch
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from ..utils.misc import PAD_NODE_ID
-
 TEST_BATCH_SIZE = 32
 
-
-def eval_one_epoch(model, neg_sampler, src, dst, ts, val_e_idx_l=None):
+def eval_one_epoch(model, walk_store, neg_sampler, src, dst, ts, val_e_idx_l=None):
     val_ap, val_auc = [], []
 
     with torch.no_grad():
@@ -28,42 +25,37 @@ def eval_one_epoch(model, neg_sampler, src, dst, ts, val_e_idx_l=None):
 
             src_l_cut = src[s_idx:e_idx]
             dst_l_cut = dst[s_idx:e_idx]
-            ts_l_cut = ts[s_idx:e_idx]
-            e_l_cut = val_e_idx_l[s_idx:e_idx] if val_e_idx_l is not None else None
+            ts_l_cut = ts[s_idx:e_idx]  # needed for sampler
 
             size = len(src_l_cut)
 
             if neg_sampler is None:
                 raise ValueError("neg_sampler must be provided")
 
+            # Temporal negative sampling
             neg_sampler.add_batch(src_l_cut, dst_l_cut, ts_l_cut)
             neg_out = neg_sampler.sample_negatives()
 
-            # sampler returns flattened (B * K)
             neg_targets = np.asarray(neg_out["targets"]).reshape(size, -1)
-
-            # we use 1 negative per positive for evaluation
             neg_targets = neg_targets[:, 0]
 
-            # --------------------------------------------------
-            # Filter invalid sentinel negatives.
-            # --------------------------------------------------
-            valid_mask = neg_targets != PAD_NODE_ID
-
+            # Filter sentinel values
+            valid_mask = neg_targets != -1
             if not np.any(valid_mask):
                 continue
 
             src_valid = src_l_cut[valid_mask]
             dst_valid = dst_l_cut[valid_mask]
             neg_valid = neg_targets[valid_mask]
-            ts_valid = ts_l_cut[valid_mask]
-            e_valid = e_l_cut[valid_mask] if e_l_cut is not None else None
 
-            # --------------------------------------------------
+            # Fetch walks
+            src_walks = walk_store.get(src_valid)
+            dst_walks = walk_store.get(dst_valid)
+            neg_walks = walk_store.get(neg_valid)
+
             # Inference
-            # --------------------------------------------------
             pos_prob, neg_prob = model.inference(
-                src_valid, dst_valid, neg_valid, ts_valid, e_valid
+                src_walks, dst_walks, neg_walks
             )
 
             pred_score = np.concatenate([
@@ -79,4 +71,4 @@ def eval_one_epoch(model, neg_sampler, src, dst, ts, val_e_idx_l=None):
             val_ap.append(average_precision_score(true_label, pred_score))
             val_auc.append(roc_auc_score(true_label, pred_score))
 
-    return np.mean(val_ap), np.mean(val_auc)
+    return float(np.mean(val_ap)), float(np.mean(val_auc))

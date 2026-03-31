@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
 
 import numpy as np
 
 
 DEFAULT_DATASETS = ['CollegeMsg', 'enron', 'TaobaoSmall', 'mooc', 'wikipedia', 'reddit']
-PAD_NODE_ID = -1
+
+PAD_NODE_ID = 0
 
 
 def process_sampling_numbers(num_neighbors, num_layers):
@@ -75,14 +75,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--negs', type=int, default=1)
     parser.add_argument('--verbosity', type=int, default=1)
 
-    # Tempest-facing knobs
     parser.add_argument('--walk_use_gpu', action='store_true', default=False)
-    parser.add_argument('--walk_direction', type=str, default='Backward_In_Time', choices=['Backward_In_Time', 'Forward_In_Time'])
+    parser.add_argument('--walk_direction', type=str, default='Backward_In_Time',
+                        choices=['Backward_In_Time', 'Forward_In_Time'])
     parser.add_argument('--walk_bias', type=str, default='ExponentialWeight')
     parser.add_argument('--initial_edge_bias', type=str, default='Uniform')
     parser.add_argument('--max_walk_len', type=int, default=80)
     parser.add_argument('--num_walks_per_node', type=int, default=10)
-    parser.add_argument('--walk_padding_value', type=int, default=0)
+    parser.add_argument('--walk_padding_value', type=int, default=PAD_NODE_ID)
     parser.add_argument('--max_time_capacity', type=int, default=-1)
     parser.add_argument('--timescale_bound', type=float, default=-1.0)
     parser.add_argument('--walk_generator_batch_size', type=int, default=10_000,
@@ -98,4 +98,11 @@ def get_args():
     except Exception:
         parser.print_help()
         sys.exit(0)
+
+    if args.walk_padding_value != PAD_NODE_ID:
+        raise ValueError(
+            f'walk_padding_value ({args.walk_padding_value}) must match PAD_NODE_ID ({PAD_NODE_ID}). '
+            'Change PAD_NODE_ID in utils/misc.py if you want to switch padding.'
+        )
+
     return args, sys.argv
