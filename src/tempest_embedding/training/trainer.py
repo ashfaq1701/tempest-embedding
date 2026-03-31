@@ -48,6 +48,15 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
     best_ap = 0.0
 
     num_walk_batches = math.ceil(num_train / walk_generator_batch_size)
+    logger.info(
+        'Training plan: %d train edges split into %d walk-batches '
+        '(walk_generator_batch_size=%d, minibatch size=%d, negs=%d)',
+        num_train,
+        num_walk_batches,
+        walk_generator_batch_size,
+        args.bs,
+        args.negs,
+    )
 
     total_stats = {'walk': 0.0, 'position': 0.0, 'model': 0.0, 'eval': 0.0}
 
@@ -76,6 +85,7 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
         )
         for b_start in batch_pbar:
             b_end = min(b_start + walk_generator_batch_size, num_train)
+            walk_batch_idx = b_start // walk_generator_batch_size + 1
 
             b_src = train_src[b_start:b_end]
             b_dst = train_dst[b_start:b_end]
@@ -85,7 +95,17 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
             t0 = perf_counter()
             _ingest_edges(walk_store, b_src, b_dst, b_ts, b_eidx, dataset)
             walk_store.build()
-            epoch_stats['walk'] += perf_counter() - t0
+            walk_build_sec = perf_counter() - t0
+            epoch_stats['walk'] += walk_build_sec
+            logger.info(
+                'Epoch %d walk-batch %d/%d: ingest+build %.2fs | edges in store=%d | nodes in store=%d',
+                epoch,
+                walk_batch_idx,
+                num_walk_batches,
+                walk_build_sec,
+                walk_store.get_num_edges(),
+                len(walk_store),
+            )
 
             train_neg_sampler.add_batch(b_src, b_dst, b_ts)
             neg_out = train_neg_sampler.sample_negatives()
@@ -101,10 +121,22 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
 
             n_edges = len(b_src_valid)
             perm = np.random.permutation(n_edges)
+            num_minibatches = math.ceil(n_edges / args.bs) if n_edges > 0 else 0
+            logger.info(
+                'Epoch %d walk-batch %d/%d: %d/%d positives have valid negatives; '
+                'running %d minibatches',
+                epoch,
+                walk_batch_idx,
+                num_walk_batches,
+                n_edges,
+                len(b_src),
+                num_minibatches,
+            )
 
             for mb_start in range(0, n_edges, args.bs):
                 mb_end = min(mb_start + args.bs, n_edges)
                 mb_idx = perm[mb_start:mb_end]
+                mb_num = mb_start // args.bs + 1
 
                 src_mb = b_src_valid[mb_idx]
                 dst_mb = b_dst_valid[mb_idx]
@@ -129,9 +161,22 @@ def train(args, model, dataset, splits, logger, get_checkpoint_path, best_model_
                 epoch_loss += loss.item()
                 num_batches += 1
 
+                if mb_num == 1 or mb_num % 50 == 0 or mb_num == num_minibatches:
+                    running_loss = epoch_loss / max(num_batches, 1)
+                    batch_pbar.set_postfix(
+                        phase='minibatch',
+                        walk_batch=f'{walk_batch_idx}/{num_walk_batches}',
+                        mb=f'{mb_num}/{num_minibatches}',
+                        loss=f'{running_loss:.4f}',
+                    )
+
             # Update batch progress bar with running loss
             running_loss = epoch_loss / max(num_batches, 1)
-            batch_pbar.set_postfix(loss=f'{running_loss:.4f}')
+            batch_pbar.set_postfix(
+                phase='walk-batch-complete',
+                walk_batch=f'{walk_batch_idx}/{num_walk_batches}',
+                loss=f'{running_loss:.4f}',
+            )
 
         batch_pbar.close()
         avg_loss = epoch_loss / max(num_batches, 1)
