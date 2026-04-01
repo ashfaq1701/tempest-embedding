@@ -22,8 +22,24 @@ class WalkEncoder(nn.Module):
         self.dropout_p = dropout_p
         self.logger = logger
 
-        self.feature_encoder = FeatureEncoder(self.feat_dim, self.model_dim, self.dropout_p, self.solver, self.step_size)
-        self.position_encoder = FeatureEncoder(self.pos_dim, self.pos_dim, self.dropout_p, self.solver, self.step_size)
+        self.feature_encoder = FeatureEncoder(
+            self.feat_dim,
+            self.model_dim,
+            self.dropout_p,
+            self.solver,
+            self.step_size,
+            logger=self.logger,
+            encoder_name='walk_feature',
+        )
+        self.position_encoder = FeatureEncoder(
+            self.pos_dim,
+            self.pos_dim,
+            self.dropout_p,
+            self.solver,
+            self.step_size,
+            logger=self.logger,
+            encoder_name='walk_position',
+        )
         self.projector = nn.Sequential(
             nn.Linear(self.feature_encoder.hidden_dim + self.position_encoder.hidden_dim, self.attn_dim),
             nn.ReLU(),
